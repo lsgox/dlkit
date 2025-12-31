@@ -2,9 +2,11 @@ package dlkit
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"net/http"
 	"os"
@@ -90,7 +92,7 @@ func NewDownloader() *Downloader {
 	return &Downloader{
 		concurrency:        defaultConcurrency,
 		chunkSize:          defaultChunkSize,
-		forceNewConnection: true,
+		forceNewConnection: false,
 		client: &http.Client{
 			Transport: transport,
 			Timeout:   defaultHTTPTimeout,
@@ -142,6 +144,14 @@ func (d *Downloader) Temp(dir string) *Downloader {
 	return d
 }
 
+// Transport allows customizing the underlying HTTP transport for connection pooling/tuning.
+func (d *Downloader) Transport(transport *http.Transport) *Downloader {
+	if transport != nil {
+		d.client.Transport = transport
+	}
+	return d
+}
+
 func (d *Downloader) ForceNewConnection(force bool) *Downloader {
 	d.forceNewConnection = force
 	return d
@@ -162,7 +172,7 @@ func (d *Downloader) checkExistingFile(filePath string, fileInfo *FileInfo) bool
 	}
 
 	if fileInfo.ContentMD5 != "" || fileInfo.HashETag != "" {
-		if _, err := d.verifyFile(filePath, fileInfo); err == nil {
+		if _, err := d.verifyFile(filePath, fileInfo, ""); err == nil {
 			return true
 		}
 		return false
@@ -199,11 +209,12 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 	}
 
 	if !fileInfo.SupportsRange {
-		if err := d.downloadDirect(ctx, url, tempPath, fileInfo.Size, false); err != nil {
+		md5Sum, err := d.downloadDirect(ctx, url, tempPath, fileInfo.Size, false, fileInfo)
+		if err != nil {
 			result.FilePath = tempPath
 			return result, err
 		}
-		verifiedPath, err := d.verifyFile(tempPath, fileInfo)
+		verifiedPath, err := d.verifyFile(tempPath, fileInfo, md5Sum)
 		if err != nil {
 			result.FilePath = tempPath
 			return result, err
@@ -226,11 +237,12 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 	shouldUseDirect := concurrency == 1 || expectedChunkCount <= 1
 
 	if shouldUseDirect {
-		if err := d.downloadDirect(ctx, url, tempPath, fileInfo.Size, true); err != nil {
+		md5Sum, err := d.downloadDirect(ctx, url, tempPath, fileInfo.Size, true, fileInfo)
+		if err != nil {
 			result.FilePath = tempPath
 			return result, err
 		}
-		verifiedPath, err := d.verifyFile(tempPath, fileInfo)
+		verifiedPath, err := d.verifyFile(tempPath, fileInfo, md5Sum)
 		if err != nil {
 			result.FilePath = tempPath
 			return result, err
@@ -266,13 +278,14 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 		return result, err
 	}
 
-	if err := d.mergeChunks(chunks, tempPath); err != nil {
+	md5Sum, err := d.mergeChunks(chunks, tempPath, fileInfo)
+	if err != nil {
 		result.FilePath = tempPath
 		return result, fmt.Errorf("failed to merge chunks: %w", err)
 	}
 
 	os.RemoveAll(tempDir)
-	verifiedPath, err := d.verifyFile(tempPath, fileInfo)
+	verifiedPath, err := d.verifyFile(tempPath, fileInfo, md5Sum)
 	if err != nil {
 		result.FilePath = tempPath
 		return result, err
@@ -377,6 +390,7 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 		return nil, err
 	}
 	d.setHeaders(req)
+	req.Header.Set("Range", "bytes=0-0")
 
 	resp, err = d.client.Do(req)
 	if err != nil {
@@ -384,12 +398,9 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP status code: %d", resp.StatusCode)
 	}
-
-	// Read and discard response body to get headers only
-	io.Copy(io.Discard, resp.Body)
 
 	info := &FileInfo{
 		SupportsRange: resp.Header.Get("Accept-Ranges") == "bytes",
@@ -397,15 +408,47 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 		ContentMD5:    resp.Header.Get("Content-MD5"),
 	}
 
+	if resp.StatusCode == http.StatusPartialContent {
+		contentRange := resp.Header.Get("Content-Range")
+		if contentRange != "" {
+			var size int64
+			n, err := fmt.Sscanf(contentRange, "bytes 0-0/%d", &size)
+			if err == nil && n == 1 && size > 0 {
+				info.Size = size
+				return info, nil
+			}
+			parts := strings.Split(contentRange, "/")
+			if len(parts) == 2 && parts[1] != "*" {
+				if size, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil && size > 0 {
+					info.Size = size
+					return info, nil
+				}
+			}
+		}
+	}
+
 	if resp.ContentLength > 0 {
 		info.Size = resp.ContentLength
 		return info, nil
 	}
 
-	return nil, fmt.Errorf("unable to determine file size: GET request didn't return Content-Length")
+	return nil, fmt.Errorf("unable to determine file size from GET Range probe")
 }
 
-func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, fileSize int64, supportsRange bool) error {
+func shouldCheckMD5(info *FileInfo) bool {
+	if info == nil {
+		return false
+	}
+	if info.ContentMD5 != "" {
+		return true
+	}
+	if len(info.HashETag) == 32 && isHexString(info.HashETag) {
+		return true
+	}
+	return false
+}
+
+func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, fileSize int64, supportsRange bool, fileInfo *FileInfo) (string, error) {
 	var startOffset int64 = 0
 	var file *os.File
 	var err error
@@ -414,7 +457,7 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 		if info, err := os.Stat(destPath); err == nil {
 			existingSize := info.Size()
 			if existingSize == fileSize {
-				return nil
+				return "", nil
 			} else if existingSize > 0 && existingSize < fileSize {
 				startOffset = existingSize
 			}
@@ -423,7 +466,7 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
-		return err
+		return "", err
 	}
 	d.setHeaders(req)
 
@@ -433,7 +476,7 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 
 	resp, err := d.client.Do(req)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer resp.Body.Close()
 
@@ -444,18 +487,18 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 		startOffset = 0
 		req, err = http.NewRequestWithContext(ctx, "GET", url, nil)
 		if err != nil {
-			return err
+			return "", err
 		}
 		d.setHeaders(req)
 		resp, err = d.client.Do(req)
 		if err != nil {
-			return err
+			return "", err
 		}
 		defer resp.Body.Close()
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return fmt.Errorf("HTTP status code: %d", resp.StatusCode)
+		return "", fmt.Errorf("HTTP status code: %d", resp.StatusCode)
 	}
 
 	if startOffset > 0 {
@@ -464,7 +507,7 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 		file, err = os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer file.Close()
 
@@ -486,10 +529,17 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 		}
 	}
 
+	var hasher hash.Hash
+	var writer io.Writer = file
+	if startOffset == 0 && shouldCheckMD5(fileInfo) {
+		hasher = md5.New()
+		writer = io.MultiWriter(file, hasher)
+	}
+
 	buf := make([]byte, defaultCopyBufferSize)
-	_, err = io.CopyBuffer(file, reader, buf)
+	_, err = io.CopyBuffer(writer, reader, buf)
 	if err != nil {
-		return err
+		return "", err
 	}
 
 	if d.onProgress != nil {
@@ -503,7 +553,10 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 		}
 	}
 
-	return nil
+	if hasher != nil {
+		return hex.EncodeToString(hasher.Sum(nil)), nil
+	}
+	return "", nil
 }
 
 func updateProgress(progress *Progress, downloaded int64, startTime time.Time) {
@@ -588,6 +641,9 @@ func (d *Downloader) calculateChunks(fileSize, chunkSize int64, tempDir string) 
 
 func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Chunk, progress *Progress, startTime time.Time, concurrency int) error {
 	semaphore := make(chan struct{}, concurrency)
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(chunks))
 	var progressCh chan int64
@@ -596,22 +652,23 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 	}
 
 	for i := range chunks {
+		chunk := chunks[i]
 		wg.Add(1)
-		go func(chunk Chunk) {
+		go func() {
 			defer wg.Done()
-
-			semaphore <- struct{}{}
+			select {
+			case semaphore <- struct{}{}:
+			case <-ctx.Done():
+				return
+			}
 			defer func() { <-semaphore }()
 
 			chunkStartTime := time.Now()
 			downloaded, err := d.downloadChunk(ctx, url, chunk)
 			chunkElapsed := time.Since(chunkStartTime)
-
 			if err != nil {
-				select {
-				case errCh <- err:
-				default:
-				}
+				errCh <- err
+				cancel()
 				return
 			}
 
@@ -627,10 +684,11 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 			if progress != nil {
 				select {
 				case progressCh <- downloaded:
-				default:
+				case <-ctx.Done():
+					return
 				}
 			}
-		}(chunks[i])
+		}()
 	}
 
 	var done chan struct{}
@@ -640,24 +698,33 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 			defer close(done)
 			lastUpdate := time.Now()
 
-			for downloaded := range progressCh {
-				progress.Downloaded += downloaded
-				updateProgress(progress, progress.Downloaded, startTime)
+			for {
+				select {
+				case downloaded, ok := <-progressCh:
+					if !ok {
+						now := time.Now()
+						if shouldUpdateProgress(now, lastUpdate, progress.Percentage) {
+							d.onProgress(progress)
+						}
+						return
+					}
+					progress.Downloaded += downloaded
+					updateProgress(progress, progress.Downloaded, startTime)
 
-				now := time.Now()
-				if shouldUpdateProgress(now, lastUpdate, progress.Percentage) {
-					d.onProgress(progress)
-					lastUpdate = now
+					now := time.Now()
+					if shouldUpdateProgress(now, lastUpdate, progress.Percentage) {
+						d.onProgress(progress)
+						lastUpdate = now
+					}
+				case <-ctx.Done():
+					return
 				}
-			}
-			now := time.Now()
-			if shouldUpdateProgress(now, lastUpdate, progress.Percentage) {
-				d.onProgress(progress)
 			}
 		}()
 	}
 
 	wg.Wait()
+
 	if progress != nil {
 		close(progressCh)
 		<-done
@@ -669,18 +736,21 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 		case err := <-errCh:
 			errs = append(errs, err)
 		default:
-			if len(errs) > 0 {
-				if len(errs) == 1 {
-					return fmt.Errorf("failed to download chunk: %w", errs[0])
-				}
-				return fmt.Errorf("failed to download %d chunks: %v", len(errs), errs)
+			if len(errs) == 0 {
+				return nil
 			}
-			return nil
+			if len(errs) == 1 {
+				return errs[0]
+			}
+			return fmt.Errorf("failed to download %d chunks: %v", len(errs), errs)
 		}
 	}
 }
 
 func (d *Downloader) downloadChunk(ctx context.Context, url string, chunk Chunk) (int64, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	if chunk.End < chunk.Start {
 		if d.resume {
 			if info, err := os.Stat(chunk.FilePath); err == nil {
@@ -743,66 +813,89 @@ func (d *Downloader) downloadChunk(ctx context.Context, url string, chunk Chunk)
 
 	resp, err := d.client.Do(req)
 	if err != nil {
+		os.Remove(chunk.FilePath)
 		return 0, err
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
+		os.Remove(chunk.FilePath)
 		return 0, fmt.Errorf("server does not support Range requests for chunked download")
 	}
 
 	if resp.StatusCode != http.StatusPartialContent {
+		os.Remove(chunk.FilePath)
 		return 0, fmt.Errorf("HTTP status code: %d", resp.StatusCode)
 	}
 
 	buf := make([]byte, defaultCopyBufferSize)
 	written, err := io.CopyBuffer(file, resp.Body, buf)
 	if err != nil {
+		os.Remove(chunk.FilePath)
 		return 0, err
 	}
 
 	totalDownloaded := startOffset + written
 	if totalDownloaded != expectedSize {
+		os.Remove(chunk.FilePath)
 		return 0, fmt.Errorf("chunk size mismatch: expected %d, got %d", expectedSize, totalDownloaded)
 	}
 
 	return written, nil
 }
 
-func (d *Downloader) mergeChunks(chunks []Chunk, destPath string) error {
+func (d *Downloader) mergeChunks(chunks []Chunk, destPath string, fileInfo *FileInfo) (string, error) {
 	destFile, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
 	if err != nil {
-		return err
+		return "", err
 	}
 	defer destFile.Close()
+
+	var hasher hash.Hash
+	var writer io.Writer = destFile
+	if shouldCheckMD5(fileInfo) {
+		hasher = md5.New()
+		writer = io.MultiWriter(destFile, hasher)
+	}
 
 	buf := make([]byte, defaultCopyBufferSize)
 
 	for _, chunk := range chunks {
 		chunkFile, err := os.Open(chunk.FilePath)
 		if err != nil {
-			return err
+			return "", err
 		}
 
-		if _, err := io.CopyBuffer(destFile, chunkFile, buf); err != nil {
+		if _, err := io.CopyBuffer(writer, chunkFile, buf); err != nil {
 			chunkFile.Close()
-			return err
+			return "", err
 		}
 
 		chunkFile.Close()
 	}
 
 	if err := destFile.Sync(); err != nil {
-		return err
+		return "", err
 	}
-	return nil
+	if hasher != nil {
+		return hex.EncodeToString(hasher.Sum(nil)), nil
+	}
+	return "", nil
 }
 
-func (d *Downloader) verifyFile(filePath string, fileInfo *FileInfo) (string, error) {
+func (d *Downloader) verifyFile(filePath string, fileInfo *FileInfo, precomputedMD5 string) (string, error) {
+	if fileInfo == nil {
+		return filePath, nil
+	}
+
 	if fileInfo.ContentMD5 != "" {
-		md5Hash, err := md5File(filePath)
-		if err != nil {
-			return "", fmt.Errorf("failed to calculate MD5: %w", err)
+		md5Hash := precomputedMD5
+		var err error
+		if md5Hash == "" {
+			md5Hash, err = md5File(filePath)
+			if err != nil {
+				return "", fmt.Errorf("failed to calculate MD5: %w", err)
+			}
 		}
 		expectedMD5, err := d.decodeBase64MD5(fileInfo.ContentMD5)
 		if err != nil {
@@ -817,9 +910,13 @@ func (d *Downloader) verifyFile(filePath string, fileInfo *FileInfo) (string, er
 
 	if fileInfo.HashETag != "" {
 		if len(fileInfo.HashETag) == 32 && isHexString(fileInfo.HashETag) {
-			md5Hash, err := md5File(filePath)
-			if err != nil {
-				return "", fmt.Errorf("failed to calculate MD5: %w", err)
+			md5Hash := precomputedMD5
+			var err error
+			if md5Hash == "" {
+				md5Hash, err = md5File(filePath)
+				if err != nil {
+					return "", fmt.Errorf("failed to calculate MD5: %w", err)
+				}
 			}
 			if md5Hash != fileInfo.HashETag {
 				os.Remove(filePath)
