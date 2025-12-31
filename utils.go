@@ -1,7 +1,11 @@
 package dlkit
 
 import (
+	"crypto/md5"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
 	"strings"
 	"time"
 )
@@ -21,21 +25,6 @@ func FormatBytes(bytes int64) string {
 
 func FormatSpeed(speed float64) string {
 	return FormatBytes(int64(speed)) + "/s"
-}
-
-func FormatDuration(d time.Duration) string {
-	if d < time.Minute {
-		return fmt.Sprintf("%.0fs", d.Seconds())
-	}
-	if d < time.Hour {
-		minutes := int(d.Minutes())
-		seconds := int(d.Seconds()) - (minutes * 60)
-		return fmt.Sprintf("%dm %ds", minutes, seconds)
-	}
-	hours := int(d.Hours())
-	minutes := int(d.Minutes()) - (hours * 60)
-	seconds := int(d.Seconds()) - (int(d.Minutes()) * 60)
-	return fmt.Sprintf("%dh %dm %ds", hours, minutes, seconds)
 }
 
 func EstimateRemainingTime(progress *Progress) time.Duration {
@@ -69,4 +58,78 @@ func isHexString(s string) bool {
 		}
 	}
 	return true
+}
+
+func md5File(filePath string) (string, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return "", err
+	}
+	defer file.Close()
+
+	hash := md5.New()
+	if _, err := io.Copy(hash, file); err != nil {
+		return "", err
+	}
+
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// ChunkConfig configures adaptive chunking behavior
+type ChunkConfig struct {
+	MinChunkSize       int64 // minimum chunk size (default: 1MB)
+	MaxChunkSize       int64 // maximum chunk size (default: 10MB)
+	OptimalConcurrency int   // optimal workers (default: 5)
+	MinConcurrency     int   // minimum workers for chunking (default: 4)
+	MaxConcurrency     int   // maximum workers (default: 10)
+	ChunksPerWorker    int   // chunks per worker for load balancing (default: 2)
+}
+
+// DefaultChunkConfig returns default configuration optimized from test results
+func DefaultChunkConfig() *ChunkConfig {
+	return &ChunkConfig{
+		MinChunkSize:       1 * 1024 * 1024,
+		MaxChunkSize:       10 * 1024 * 1024,
+		OptimalConcurrency: 5,
+		MinConcurrency:     4,
+		MaxConcurrency:     10,
+		ChunksPerWorker:    2,
+	}
+}
+
+// AdaptiveChunk creates a function that calculates optimal chunk size and concurrency
+func AdaptiveChunk(config *ChunkConfig) func(fileSize int64, currentChunkSize int64, currentConcurrency int) (chunkSize int64, concurrency int) {
+	if config == nil {
+		config = DefaultChunkConfig()
+	}
+
+	return func(fileSize int64, currentChunkSize int64, currentConcurrency int) (chunkSize int64, concurrency int) {
+		concurrency = currentConcurrency
+		if concurrency < config.MinConcurrency {
+			concurrency = config.OptimalConcurrency
+		} else if concurrency > config.MaxConcurrency {
+			concurrency = config.MaxConcurrency
+		}
+
+		desiredChunkCount := config.ChunksPerWorker * concurrency
+		chunkSize = fileSize / int64(desiredChunkCount)
+
+		if chunkSize < config.MinChunkSize {
+			chunkSize = config.MinChunkSize
+		}
+		if chunkSize > config.MaxChunkSize {
+			chunkSize = config.MaxChunkSize
+		}
+
+		actualChunkCount := int((fileSize + chunkSize - 1) / chunkSize)
+		if actualChunkCount < concurrency {
+			targetChunkCount := concurrency * config.ChunksPerWorker
+			chunkSize = fileSize / int64(targetChunkCount)
+			if chunkSize < config.MinChunkSize {
+				chunkSize = config.MinChunkSize
+			}
+		}
+
+		return chunkSize, concurrency
+	}
 }
