@@ -37,7 +37,7 @@ type Downloader struct {
 	onChunkSpeed       func(chunkIndex int, speed float64, chunkSize int64)
 	tempDir            string
 	defaultHeaders     map[string]string
-	forceNewConnection bool // default: true, better performance for chunked downloads
+	forceNewConnection bool
 }
 
 type Progress struct {
@@ -71,6 +71,28 @@ func (r *DownloadResult) CleanupTempFiles() error {
 		return fmt.Errorf("cleanup errors: %v", errs)
 	}
 	return nil
+}
+
+func (r *DownloadResult) Cleanup() error {
+	var errs []error
+	err := r.CleanupTempFiles()
+	if err != nil {
+		errs = append(errs, err)
+	}
+	if r.TempDir != "" {
+		errs = append(errs, os.RemoveAll(r.TempDir))
+	}
+	if err := os.Remove(r.FilePath); err != nil && !os.IsNotExist(err) {
+		errs = append(errs, err)
+	}
+	if len(errs) > 0 {
+		return fmt.Errorf("cleanup errors: %v", errs)
+	}
+	return nil
+}
+
+func (r *DownloadResult) SaveTo(filePath string) error {
+	return os.Rename(r.FilePath, filePath)
 }
 
 type Chunk struct {
@@ -144,7 +166,6 @@ func (d *Downloader) Temp(dir string) *Downloader {
 	return d
 }
 
-// Transport allows customizing the underlying HTTP transport for connection pooling/tuning.
 func (d *Downloader) Transport(transport *http.Transport) *Downloader {
 	if transport != nil {
 		d.client.Transport = transport
@@ -229,9 +250,9 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 		chunkSize, concurrency = d.onChunkConfig(fileInfo.Size, d.chunkSize, d.concurrency)
 	}
 
-	expectedChunkCount := int((fileInfo.Size + chunkSize - 1) / chunkSize)
-	if fileInfo.Size == 0 {
-		expectedChunkCount = 1
+	expectedChunkCount := 1
+	if fileInfo.Size > 0 {
+		expectedChunkCount = int((fileInfo.Size + chunkSize - 1) / chunkSize)
 	}
 
 	shouldUseDirect := concurrency == 1 || expectedChunkCount <= 1
@@ -312,6 +333,19 @@ type FileInfo struct {
 	ContentMD5    string
 }
 
+func (f *FileInfo) shouldCheckMD5() bool {
+	if f == nil {
+		return false
+	}
+	if f.ContentMD5 != "" {
+		return true
+	}
+	if len(f.HashETag) == 32 && isHexString(f.HashETag) {
+		return true
+	}
+	return false
+}
+
 func (d *Downloader) setHeaders(req *http.Request) {
 	for k, v := range d.defaultHeaders {
 		if v != "" {
@@ -333,7 +367,6 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 	}
 	defer resp.Body.Close()
 
-	// If HEAD request succeeds, try to get info from headers
 	if resp.StatusCode == http.StatusOK {
 		info := &FileInfo{
 			SupportsRange: resp.Header.Get("Accept-Ranges") == "bytes",
@@ -346,53 +379,27 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 			return info, nil
 		}
 
-		// If HEAD doesn't have Content-Length but supports Range, try Range request
 		if info.SupportsRange {
-			req, err = http.NewRequestWithContext(ctx, "GET", url, nil)
-			if err != nil {
-				return nil, err
-			}
-			d.setHeaders(req)
-			req.Header.Set("Range", "bytes=0-0")
-
-			resp, err = d.client.Do(req)
-			if err != nil {
-				return nil, err
-			}
-			defer resp.Body.Close()
-
-			if resp.StatusCode == http.StatusPartialContent {
-				contentRange := resp.Header.Get("Content-Range")
-				if contentRange != "" {
-					var size int64
-					n, err := fmt.Sscanf(contentRange, "bytes 0-0/%d", &size)
-					if err == nil && n == 1 && size > 0 {
-						info.Size = size
-						return info, nil
-					}
-					parts := strings.Split(contentRange, "/")
-					if len(parts) == 2 && parts[1] != "*" {
-						if size, err := strconv.ParseInt(strings.TrimSpace(parts[1]), 10, 64); err == nil && size > 0 {
-							info.Size = size
-							return info, nil
-						}
-					}
-				}
+			if probed, err := d.getFileInfoTryRange(ctx, url); err == nil {
+				return probed, nil
 			}
 		}
 
 		return nil, fmt.Errorf("unable to determine file size: HEAD request didn't return Content-Length")
 	}
 
-	// HEAD request failed (e.g., 405 Method Not Allowed), try GET request
-	req, err = http.NewRequestWithContext(ctx, "GET", url, nil)
+	return d.getFileInfoTryRange(ctx, url)
+}
+
+func (d *Downloader) getFileInfoTryRange(ctx context.Context, url string) (*FileInfo, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return nil, err
 	}
 	d.setHeaders(req)
 	req.Header.Set("Range", "bytes=0-0")
 
-	resp, err = d.client.Do(req)
+	resp, err := d.client.Do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -433,19 +440,6 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 	}
 
 	return nil, fmt.Errorf("unable to determine file size from GET Range probe")
-}
-
-func shouldCheckMD5(info *FileInfo) bool {
-	if info == nil {
-		return false
-	}
-	if info.ContentMD5 != "" {
-		return true
-	}
-	if len(info.HashETag) == 32 && isHexString(info.HashETag) {
-		return true
-	}
-	return false
 }
 
 func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, fileSize int64, supportsRange bool, fileInfo *FileInfo) (string, error) {
@@ -531,7 +525,7 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 
 	var hasher hash.Hash
 	var writer io.Writer = file
-	if startOffset == 0 && shouldCheckMD5(fileInfo) {
+	if startOffset == 0 && fileInfo.shouldCheckMD5() {
 		hasher = md5.New()
 		writer = io.MultiWriter(file, hasher)
 	}
@@ -853,7 +847,7 @@ func (d *Downloader) mergeChunks(chunks []Chunk, destPath string, fileInfo *File
 
 	var hasher hash.Hash
 	var writer io.Writer = destFile
-	if shouldCheckMD5(fileInfo) {
+	if fileInfo.shouldCheckMD5() {
 		hasher = md5.New()
 		writer = io.MultiWriter(destFile, hasher)
 	}
