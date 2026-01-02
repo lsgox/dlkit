@@ -32,6 +32,7 @@ type Downloader struct {
 	chunkSize          int64
 	client             *http.Client
 	onProgress         func(progress *Progress)
+	onFileInfo         func(info *FileInfo) error
 	resume             bool
 	onChunkConfig      func(fileSize int64, currentChunkSize int64, currentConcurrency int) (chunkSize int64, concurrency int)
 	onChunkSpeed       func(chunkIndex int, speed float64, chunkSize int64)
@@ -146,6 +147,11 @@ func (d *Downloader) Progress(fn func(*Progress)) *Downloader {
 	return d
 }
 
+func (d *Downloader) OnFileInfo(fn func(info *FileInfo) error) *Downloader {
+	d.onFileInfo = fn
+	return d
+}
+
 func (d *Downloader) EnableResume(enable bool) *Downloader {
 	d.resume = enable
 	return d
@@ -210,6 +216,12 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 	fileInfo, err := d.getFileInfo(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get file info: %w", err)
+	}
+
+	if d.onFileInfo != nil {
+		if err := d.onFileInfo(fileInfo); err != nil {
+			return nil, err
+		}
 	}
 
 	tempFile, err := d.createTempFile()
@@ -331,6 +343,7 @@ type FileInfo struct {
 	SupportsRange bool
 	HashETag      string
 	ContentMD5    string
+	LastModified  string
 }
 
 func (f *FileInfo) shouldCheckMD5() bool {
@@ -372,6 +385,7 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 			SupportsRange: resp.Header.Get("Accept-Ranges") == "bytes",
 			HashETag:      parseHashETag(resp.Header.Get("ETag")),
 			ContentMD5:    resp.Header.Get("Content-MD5"),
+			LastModified:  resp.Header.Get("Last-Modified"),
 		}
 
 		if resp.ContentLength > 0 {
@@ -413,6 +427,7 @@ func (d *Downloader) getFileInfoTryRange(ctx context.Context, url string) (*File
 		SupportsRange: resp.Header.Get("Accept-Ranges") == "bytes",
 		HashETag:      parseHashETag(resp.Header.Get("ETag")),
 		ContentMD5:    resp.Header.Get("Content-MD5"),
+		LastModified:  resp.Header.Get("Last-Modified"),
 	}
 
 	if resp.StatusCode == http.StatusPartialContent {
