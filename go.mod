@@ -1,3 +1,3 @@
 module github.com/lsgox/dlkit
 
-go 1.24.7
+go 1.20

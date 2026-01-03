@@ -23,7 +23,6 @@ func main() {
 	workers := flag.Int("w", 5, "concurrent workers, 1 disables chunking")
 	chunkSize := flag.Int64("chunk", 10*1024*1024, "chunk size in bytes, only when worker>1")
 	resume := flag.Bool("resume", true, "enable resume")
-	adaptive := flag.Bool("adaptive", true, "enable adaptive chunk/concurrency")
 	forceNewConn := flag.Bool("force-new-conn", false, "force new connection per chunk")
 	tempDir := flag.String("temp", "", "temp directory, default system temp")
 
@@ -38,19 +37,17 @@ func main() {
 	defer stop()
 
 	dl := dlkit.NewDownloader()
-	if *workers > 0 {
-		dl.Workers(*workers)
-	}
-	if *chunkSize > 0 {
-		dl.Chunk(*chunkSize)
-	}
+
 	dl.EnableResume(*resume)
 	dl.ForceNewConnection(*forceNewConn)
 	if *tempDir != "" {
 		dl.Temp(*tempDir)
 	}
-	if *adaptive {
-		dl.AdaptiveChunk(dlkit.AdaptiveChunk(nil))
+	if *chunkSize > 0 {
+		dl.Chunk(*chunkSize)
+	}
+	if *workers > 0 {
+		dl.Workers(*workers)
 	}
 
 	start := time.Now()

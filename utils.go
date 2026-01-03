@@ -98,7 +98,7 @@ func DefaultChunkConfig() *ChunkConfig {
 }
 
 // AdaptiveChunk creates a function that calculates optimal chunk size and concurrency
-func AdaptiveChunk(config *ChunkConfig) func(fileSize int64, currentChunkSize int64, currentConcurrency int) (chunkSize int64, concurrency int) {
+func AdaptiveChunk(config *ChunkConfig) ChunkConfigFunc {
 	if config == nil {
 		config = DefaultChunkConfig()
 	}

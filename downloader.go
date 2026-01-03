@@ -27,6 +27,8 @@ const (
 	defaultCopyBufferSize         = 256 * 1024
 )
 
+type ChunkConfigFunc func(fileSize int64, currentChunkSize int64, currentConcurrency int) (chunkSize int64, concurrency int)
+
 type Downloader struct {
 	concurrency        int
 	chunkSize          int64
@@ -34,7 +36,7 @@ type Downloader struct {
 	onProgress         func(progress *Progress)
 	onFileInfo         func(info *FileInfo) error
 	resume             bool
-	onChunkConfig      func(fileSize int64, currentChunkSize int64, currentConcurrency int) (chunkSize int64, concurrency int)
+	onChunkConfig      ChunkConfigFunc
 	onChunkProgress    func(index int, progress *Progress)
 	tempDir            string
 	defaultHeaders     map[string]string
@@ -404,14 +406,6 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 			info.Size = resp.ContentLength
 			return info, nil
 		}
-
-		if info.SupportsRange {
-			if probed, err := d.getFileInfoTryRange(ctx, url); err == nil {
-				return probed, nil
-			}
-		}
-
-		return nil, fmt.Errorf("unable to determine file size: HEAD request didn't return Content-Length")
 	}
 
 	return d.getFileInfoTryRange(ctx, url)
@@ -432,7 +426,7 @@ func (d *Downloader) getFileInfoTryRange(ctx context.Context, url string) (*File
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP status code: %d", resp.StatusCode)
+		return nil, StatusCodeError(resp.StatusCode)
 	}
 
 	info := &FileInfo{
@@ -466,7 +460,7 @@ func (d *Downloader) getFileInfoTryRange(ctx context.Context, url string) (*File
 		return info, nil
 	}
 
-	return nil, fmt.Errorf("unable to determine file size from GET Range probe")
+	return nil, ErrBadLength
 }
 
 func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, fileSize int64, supportsRange bool, fileInfo *FileInfo) (string, error) {
@@ -519,7 +513,7 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 	}
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
-		return "", fmt.Errorf("HTTP status code: %d", resp.StatusCode)
+		return "", StatusCodeError(resp.StatusCode)
 	}
 
 	if startOffset > 0 {
@@ -695,10 +689,7 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 				select {
 				case downloaded, ok := <-progressCh:
 					if !ok {
-						now := time.Now()
-						if shouldUpdateProgress(now, lastUpdate, progress.Percentage) {
-							d.onProgress(progress)
-						}
+						d.onProgress(progress)
 						return
 					}
 					totalDownloaded := progress.Downloaded + downloaded
@@ -818,7 +809,7 @@ func (d *Downloader) downloadChunk(ctx context.Context, url string, chunk Chunk)
 
 	if resp.StatusCode != http.StatusPartialContent {
 		os.Remove(chunk.FilePath)
-		return 0, fmt.Errorf("HTTP status code: %d", resp.StatusCode)
+		return 0, StatusCodeError(resp.StatusCode)
 	}
 
 	var reader io.Reader = resp.Body
@@ -915,7 +906,11 @@ func (d *Downloader) verifyFile(filePath string, fileInfo *FileInfo, precomputed
 		}
 		if md5Hash != expectedMD5 {
 			os.Remove(filePath)
-			return "", fmt.Errorf("Content-MD5 mismatch: expected %s, got %s", expectedMD5, md5Hash)
+			return "", &ErrChecksumMismatch{
+				Expected: expectedMD5,
+				Actual:   md5Hash,
+				Type:     "Content-MD5",
+			}
 		}
 		return filePath, nil
 	}
@@ -932,7 +927,11 @@ func (d *Downloader) verifyFile(filePath string, fileInfo *FileInfo, precomputed
 			}
 			if md5Hash != fileInfo.HashETag {
 				os.Remove(filePath)
-				return "", fmt.Errorf("ETag mismatch: expected %s, got %s", fileInfo.HashETag, md5Hash)
+				return "", &ErrChecksumMismatch{
+					Expected: fileInfo.HashETag,
+					Actual:   md5Hash,
+					Type:     "ETag",
+				}
 			}
 			return filePath, nil
 		}
@@ -945,7 +944,10 @@ func (d *Downloader) verifyFile(filePath string, fileInfo *FileInfo, precomputed
 
 	if fileInfo.Size > 0 && fileInfo2.Size() != fileInfo.Size {
 		os.Remove(filePath)
-		return "", fmt.Errorf("file size mismatch: expected %d, got %d", fileInfo.Size, fileInfo2.Size())
+		return "", &ErrFileSizeMismatch{
+			Expected: fileInfo.Size,
+			Actual:   fileInfo2.Size(),
+		}
 	}
 
 	return filePath, nil
