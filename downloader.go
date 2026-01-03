@@ -35,7 +35,7 @@ type Downloader struct {
 	onFileInfo         func(info *FileInfo) error
 	resume             bool
 	onChunkConfig      func(fileSize int64, currentChunkSize int64, currentConcurrency int) (chunkSize int64, concurrency int)
-	onChunkSpeed       func(chunkIndex int, speed float64, chunkSize int64)
+	onChunkProgress    func(index int, progress *Progress)
 	tempDir            string
 	defaultHeaders     map[string]string
 	forceNewConnection bool
@@ -47,6 +47,20 @@ type Progress struct {
 	Percentage  float64
 	Speed       float64
 	ElapsedTime time.Duration
+}
+
+func (p *Progress) update(downloaded int64, startTime time.Time) {
+	p.Downloaded = downloaded
+	elapsed := time.Since(startTime)
+	p.ElapsedTime = elapsed
+	if elapsed.Seconds() > 0 {
+		p.Speed = float64(downloaded) / elapsed.Seconds()
+	}
+	if p.TotalSize > 0 {
+		p.Percentage = float64(downloaded) / float64(p.TotalSize) * 100
+	} else {
+		p.Percentage = 100
+	}
 }
 
 type DownloadResult struct {
@@ -162,8 +176,8 @@ func (d *Downloader) AdaptiveChunk(fn func(fileSize int64, currentChunkSize int6
 	return d
 }
 
-func (d *Downloader) ChunkSpeed(fn func(chunkIndex int, speed float64, chunkSize int64)) *Downloader {
-	d.onChunkSpeed = fn
+func (d *Downloader) ChunkProgress(fn func(index int, progress *Progress)) *Downloader {
+	d.onChunkProgress = fn
 	return d
 }
 
@@ -298,15 +312,13 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 	}
 
 	var progress *Progress
-	var startTime time.Time
 	if d.onProgress != nil {
 		progress = &Progress{
 			TotalSize: fileInfo.Size,
 		}
-		startTime = time.Now()
 	}
 
-	if err := d.downloadChunks(ctx, url, chunks, progress, startTime, concurrency); err != nil {
+	if err := d.downloadChunks(ctx, url, chunks, progress, concurrency); err != nil {
 		result.FilePath = tempPath
 		return result, err
 	}
@@ -534,6 +546,7 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 			progress:   progress,
 			downloaded: &downloaded,
 			onProgress: d.onProgress,
+			chunkIndex: -1,
 			startTime:  startTime,
 		}
 	}
@@ -551,35 +564,10 @@ func (d *Downloader) downloadDirect(ctx context.Context, url, destPath string, f
 		return "", err
 	}
 
-	if d.onProgress != nil {
-		if pr, ok := reader.(*progressReader); ok {
-			now := time.Now()
-			if shouldUpdateProgress(now, pr.lastUpdate, pr.progress.Percentage) {
-				updateProgress(pr.progress, pr.progress.TotalSize, pr.startTime)
-				pr.lastUpdate = now
-				d.onProgress(pr.progress)
-			}
-		}
-	}
-
 	if hasher != nil {
 		return hex.EncodeToString(hasher.Sum(nil)), nil
 	}
 	return "", nil
-}
-
-func updateProgress(progress *Progress, downloaded int64, startTime time.Time) {
-	progress.Downloaded = downloaded
-	elapsed := time.Since(startTime)
-	progress.ElapsedTime = elapsed
-	if elapsed.Seconds() > 0 {
-		progress.Speed = float64(downloaded) / elapsed.Seconds()
-	}
-	if progress.TotalSize > 0 {
-		progress.Percentage = float64(downloaded) / float64(progress.TotalSize) * 100
-	} else {
-		progress.Percentage = 100
-	}
 }
 
 func shouldUpdateProgress(now time.Time, lastUpdate time.Time, percentage float64) bool {
@@ -587,19 +575,21 @@ func shouldUpdateProgress(now time.Time, lastUpdate time.Time, percentage float6
 }
 
 type progressReader struct {
-	reader     io.Reader
-	progress   *Progress
-	downloaded *int64
-	onProgress func(*Progress)
-	startTime  time.Time
-	lastUpdate time.Time
+	reader          io.Reader
+	progress        *Progress
+	downloaded      *int64
+	onProgress      func(*Progress)
+	onChunkProgress func(int, *Progress)
+	chunkIndex      int
+	startTime       time.Time
+	lastUpdate      time.Time
 }
 
 func (pr *progressReader) Read(p []byte) (n int, err error) {
 	n, err = pr.reader.Read(p)
-	if n > 0 && pr.onProgress != nil {
+	if n > 0 {
 		downloaded := atomic.AddInt64(pr.downloaded, int64(n))
-		pr.progress.Downloaded = downloaded
+		pr.progress.update(downloaded, pr.startTime)
 
 		now := time.Now()
 		if !shouldUpdateProgress(now, pr.lastUpdate, pr.progress.Percentage) && err == nil {
@@ -607,8 +597,11 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 		}
 		pr.lastUpdate = now
 
-		updateProgress(pr.progress, downloaded, pr.startTime)
-		pr.onProgress(pr.progress)
+		if pr.chunkIndex >= 0 && pr.onChunkProgress != nil {
+			pr.onChunkProgress(pr.chunkIndex, pr.progress)
+		} else if pr.onProgress != nil {
+			pr.onProgress(pr.progress)
+		}
 	}
 	return n, err
 }
@@ -648,7 +641,7 @@ func (d *Downloader) calculateChunks(fileSize, chunkSize int64, tempDir string) 
 	return chunks
 }
 
-func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Chunk, progress *Progress, startTime time.Time, concurrency int) error {
+func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Chunk, progress *Progress, concurrency int) error {
 	semaphore := make(chan struct{}, concurrency)
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -656,8 +649,10 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 	var wg sync.WaitGroup
 	errCh := make(chan error, len(chunks))
 	var progressCh chan int64
+	var startTime time.Time
 	if progress != nil {
 		progressCh = make(chan int64, len(chunks))
+		startTime = time.Now()
 	}
 
 	for i := range chunks {
@@ -672,22 +667,11 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 			}
 			defer func() { <-semaphore }()
 
-			chunkStartTime := time.Now()
 			downloaded, err := d.downloadChunk(ctx, url, chunk)
-			chunkElapsed := time.Since(chunkStartTime)
 			if err != nil {
 				errCh <- err
 				cancel()
 				return
-			}
-
-			chunkSize := chunk.End - chunk.Start + 1
-			if d.onChunkSpeed != nil {
-				var chunkSpeed float64
-				if chunkElapsed.Seconds() > 0 {
-					chunkSpeed = float64(chunkSize) / chunkElapsed.Seconds()
-				}
-				d.onChunkSpeed(chunk.Index, chunkSpeed, chunkSize)
 			}
 
 			if progress != nil {
@@ -717,8 +701,8 @@ func (d *Downloader) downloadChunks(ctx context.Context, url string, chunks []Ch
 						}
 						return
 					}
-					progress.Downloaded += downloaded
-					updateProgress(progress, progress.Downloaded, startTime)
+					totalDownloaded := progress.Downloaded + downloaded
+					progress.update(totalDownloaded, startTime)
 
 					now := time.Now()
 					if shouldUpdateProgress(now, lastUpdate, progress.Percentage) {
@@ -837,8 +821,27 @@ func (d *Downloader) downloadChunk(ctx context.Context, url string, chunk Chunk)
 		return 0, fmt.Errorf("HTTP status code: %d", resp.StatusCode)
 	}
 
+	var reader io.Reader = resp.Body
+	if d.onChunkProgress != nil {
+		chunkProgress := &Progress{
+			TotalSize:  expectedSize,
+			Downloaded: startOffset,
+		}
+		chunkStartTime := time.Now()
+		downloaded := startOffset
+
+		reader = &progressReader{
+			reader:          resp.Body,
+			progress:        chunkProgress,
+			downloaded:      &downloaded,
+			onChunkProgress: d.onChunkProgress,
+			chunkIndex:      chunk.Index,
+			startTime:       chunkStartTime,
+		}
+	}
+
 	buf := make([]byte, defaultCopyBufferSize)
-	written, err := io.CopyBuffer(file, resp.Body, buf)
+	written, err := io.CopyBuffer(file, reader, buf)
 	if err != nil {
 		os.Remove(chunk.FilePath)
 		return 0, err
