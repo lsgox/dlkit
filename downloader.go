@@ -601,17 +601,6 @@ func (pr *progressReader) Read(p []byte) (n int, err error) {
 }
 
 func (d *Downloader) calculateChunks(fileSize, chunkSize int64, tempDir string) []Chunk {
-	if fileSize == 0 {
-		return []Chunk{
-			{
-				Index:    0,
-				Start:    0,
-				End:      -1,
-				FilePath: filepath.Join(tempDir, "chunk_0"),
-			},
-		}
-	}
-
 	chunkCount := int((fileSize + chunkSize - 1) / chunkSize)
 	chunks := make([]Chunk, 0, chunkCount)
 
