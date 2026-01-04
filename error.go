@@ -7,7 +7,8 @@ import (
 )
 
 var (
-	ErrBadLength = errors.New("bad content length")
+	ErrBadLength      = errors.New("bad content length")
+	ErrVerifyMismatch = errors.New("verify mismatch")
 )
 
 type StatusCodeError int
@@ -31,6 +32,10 @@ func (e *ErrChecksumMismatch) Error() string {
 	return fmt.Sprintf("checksum %s mismatch: expected %s, got %s", e.Type, e.Expected, e.Actual)
 }
 
+func (e *ErrChecksumMismatch) Is(target error) bool {
+	return errors.Is(target, ErrVerifyMismatch)
+}
+
 func IsChecksumMismatch(err error) bool {
 	var e *ErrChecksumMismatch
 	return errors.As(err, &e)
@@ -43,6 +48,10 @@ type ErrFileSizeMismatch struct {
 
 func (e *ErrFileSizeMismatch) Error() string {
 	return fmt.Sprintf("file size mismatch: expected %d, got %d", e.Expected, e.Actual)
+}
+
+func (e *ErrFileSizeMismatch) Is(target error) bool {
+	return errors.Is(target, ErrVerifyMismatch)
 }
 
 func IsFileSizeMismatch(err error) bool {
