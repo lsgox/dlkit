@@ -75,7 +75,7 @@ func main() {
 	log.Println("start download:", *uri)
 	result, err := dl.Download(ctx, *uri)
 	if err != nil {
-		log.Printf("\ndownload failed: %v\n", err)
+		log.Printf("download failed: %v", err)
 		os.Exit(1)
 	}
 	defer result.CleanupTempFiles()
@@ -93,16 +93,16 @@ func main() {
 	}
 	if outPath != "" {
 		if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil && !os.IsExist(err) {
-			log.Printf("\ncreate output dir failed: %v\n", err)
+			log.Printf("create output dir failed: %v", err)
 			os.Exit(1)
 		}
 		if err := result.SaveTo(outPath); err != nil {
-			log.Printf("\nsave file failed: %v\n", err)
+			log.Printf("save file failed: %v", err)
 			os.Exit(1)
 		}
 		finalPath = outPath
 	}
 
 	elapsed := time.Since(start)
-	log.Printf("download finished: %s (elapsed: %v)\n", finalPath, elapsed)
+	log.Printf("download finished: %s (elapsed: %v)", finalPath, elapsed)
 }

@@ -257,7 +257,7 @@ func (d *Downloader) Download(ctx context.Context, url string) (*DownloadResult,
 		return result, nil
 	}
 
-	if !fileInfo.SupportsRange {
+	if !fileInfo.SupportsRange || fileInfo.Size == 0 {
 		md5Sum, err := d.downloadDirect(ctx, url, tempPath, fileInfo.Size, false, fileInfo)
 		if err != nil {
 			result.FilePath = tempPath
@@ -392,7 +392,8 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 
 	if resp.StatusCode == http.StatusOK {
 		info := &FileInfo{
@@ -404,6 +405,13 @@ func (d *Downloader) getFileInfo(ctx context.Context, url string) (*FileInfo, er
 
 		if resp.ContentLength > 0 {
 			info.Size = resp.ContentLength
+			return info, nil
+		}
+
+		isChunked := strings.ToLower(resp.Header.Get("Transfer-Encoding")) == "chunked"
+		if isChunked || resp.ContentLength == -1 {
+			info.Size = 0
+			info.SupportsRange = false
 			return info, nil
 		}
 	}
@@ -423,7 +431,8 @@ func (d *Downloader) getFileInfoTryRange(ctx context.Context, url string) (*File
 	if err != nil {
 		return nil, err
 	}
-	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
 
 	if resp.StatusCode != http.StatusPartialContent && resp.StatusCode != http.StatusOK {
 		return nil, StatusCodeError(resp.StatusCode)
@@ -435,6 +444,8 @@ func (d *Downloader) getFileInfoTryRange(ctx context.Context, url string) (*File
 		ContentMD5:    resp.Header.Get("Content-MD5"),
 		LastModified:  resp.Header.Get("Last-Modified"),
 	}
+
+	isChunked := strings.ToLower(resp.Header.Get("Transfer-Encoding")) == "chunked"
 
 	if resp.StatusCode == http.StatusPartialContent {
 		contentRange := resp.Header.Get("Content-Range")
@@ -457,6 +468,12 @@ func (d *Downloader) getFileInfoTryRange(ctx context.Context, url string) (*File
 
 	if resp.ContentLength > 0 {
 		info.Size = resp.ContentLength
+		return info, nil
+	}
+
+	if isChunked || resp.ContentLength == -1 {
+		info.Size = 0
+		info.SupportsRange = false
 		return info, nil
 	}
 
