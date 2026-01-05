@@ -126,6 +126,7 @@ func NewDownloader() *Downloader {
 		MaxIdleConnsPerHost: 50,
 		IdleConnTimeout:     defaultIdleConnTimeout,
 		DisableKeepAlives:   false,
+		Proxy:               http.ProxyFromEnvironment,
 	}
 
 	return &Downloader{
