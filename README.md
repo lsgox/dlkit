@@ -150,10 +150,10 @@ eta := dlkit.EstimateRemainingTime(progress)
 if dlkit.IsStatusCodeError(err) {
     // HTTP 状态码错误
 }
-if dlkit.IsChecksumMismatch(err) {
+if dlkit.IsErrChecksumMismatch(err) {
     // 校验和不匹配
 }
-if dlkit.IsFileSizeMismatch(err) {
+if dlkit.IsErrFileSizeMismatch(err) {
     // 文件大小不匹配
 }
 ```

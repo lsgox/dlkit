@@ -36,7 +36,7 @@ func (e *ErrChecksumMismatch) Is(target error) bool {
 	return errors.Is(target, ErrVerifyMismatch)
 }
 
-func IsChecksumMismatch(err error) bool {
+func IsErrChecksumMismatch(err error) bool {
 	var e *ErrChecksumMismatch
 	return errors.As(err, &e)
 }
@@ -54,11 +54,11 @@ func (e *ErrFileSizeMismatch) Is(target error) bool {
 	return errors.Is(target, ErrVerifyMismatch)
 }
 
-func IsFileSizeMismatch(err error) bool {
+func IsErrFileSizeMismatch(err error) bool {
 	var e *ErrFileSizeMismatch
 	return errors.As(err, &e)
 }
 
-func IsVerifyError(err error) bool {
-	return IsChecksumMismatch(err) || IsFileSizeMismatch(err)
+func IsErrVerifyMismatch(err error) bool {
+	return IsErrChecksumMismatch(err) || IsErrFileSizeMismatch(err)
 }
